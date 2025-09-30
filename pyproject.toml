@@ -1,0 +1,24 @@
+[project]
+name = "cloud-stt-compare"
+version = "0.1.0"
+description = "Compare cloud speech-to-text services (GCP and AWS)"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = []
+
+[project.optional-dependencies]
+gcp = [
+    "google-cloud-speech>=2.0.0",
+    "pyaudio>=0.2.13",
+]
+aws = [
+    "amazon-transcribe>=0.6.0",
+    "sounddevice>=0.4.6",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["gcp", "aws"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
