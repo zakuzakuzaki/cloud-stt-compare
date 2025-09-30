@@ -3,7 +3,10 @@
 This script records audio from the system default microphone, streams it to a
 Google Cloud Speech-to-Text v2 recognizer, and prints transcription results in
 real time. It is inspired by Google's streaming recognition example for v2 but
-captures audio from a live microphone instead of reading from a local file.
+captures audio from a live microphone instead of reading from a local file. The
+stream automatically leverages voice activity detection (VAD) events to stop
+recording after roughly six seconds of silence while allowing speech to extend
+the session up to thirty seconds.
 
 Prerequisites:
   * Install dependencies: `pip install google-cloud-speech sounddevice`.
@@ -24,6 +27,8 @@ from __future__ import annotations
 import argparse
 import queue
 import sys
+import threading
+import time
 from typing import Generator, Iterable
 
 import sounddevice as sd
@@ -34,6 +39,97 @@ DEFAULT_SAMPLE_RATE = 16000
 CHANNELS = 1
 # Send roughly 100ms of audio per request for low latency.
 CHUNK_SIZE = int(DEFAULT_SAMPLE_RATE / 10)
+# Base duration to capture before voice activity driven extensions (seconds).
+DEFAULT_INITIAL_DURATION = 6.0
+# Maximum duration allowed for a single streaming session (seconds).
+MAX_STREAM_DURATION = 30.0
+
+
+class StreamingController:
+    """Coordinate stream lifetime based on voice activity events."""
+
+    def __init__(self, base_duration: float, max_duration: float) -> None:
+        self.base_duration = base_duration
+        self.max_duration = max_duration
+        self.start_time = time.monotonic()
+        self.last_activity = self.start_time
+        self.voice_active = False
+        self._lock = threading.Lock()
+
+    def mark_voice_active(self) -> None:
+        """Record that the API detected voice activity."""
+
+        with self._lock:
+            self.voice_active = True
+            self.last_activity = time.monotonic()
+
+    def mark_voice_inactive(self) -> None:
+        """Record that the API detected the end of voice activity."""
+
+        with self._lock:
+            self.voice_active = False
+
+    def mark_transcript_activity(self) -> None:
+        """Record transcript updates as ongoing activity."""
+
+        with self._lock:
+            self.last_activity = time.monotonic()
+
+    def should_stop(self) -> bool:
+        """Return True when streaming should stop based on timers/VAD."""
+
+        now = time.monotonic()
+        with self._lock:
+            elapsed = now - self.start_time
+            if elapsed >= self.max_duration:
+                return True
+            if elapsed <= self.base_duration:
+                return False
+            if self.voice_active:
+                return False
+            # Allow a small grace period after the last detected activity.
+            if (now - self.last_activity) <= 1.5:
+                return False
+            return True
+
+    def handle_voice_activity_event(
+        self, event: speech_v2.StreamingRecognizeResponse.VoiceActivityEvent
+    ) -> None:
+        """Interpret VAD events from the API and update state."""
+
+        event_type = getattr(event, "voice_activity_event_type", None)
+        if event_type is None:
+            return
+
+        # The enum may expose either a string representation or an Enum object.
+        if hasattr(event_type, "name"):
+            name = event_type.name
+        else:
+            name = str(event_type)
+
+        normalized = name.upper()
+        if "UNSPECIFIED" in normalized:
+            return
+        if "END" in normalized or "STOP" in normalized:
+            self.mark_voice_inactive()
+        else:
+            self.mark_voice_active()
+
+    def handle_speech_event_type(self, event_type: object) -> None:
+        """Fallback handling for speech event types when VAD events are absent."""
+
+        if event_type is None:
+            return
+        if hasattr(event_type, "name"):
+            name = event_type.name
+        else:
+            name = str(event_type)
+
+        normalized = name.upper()
+        if "END" in normalized:
+            self.mark_voice_inactive()
+        elif "SPEECH" in normalized or "START" in normalized:
+            self.mark_voice_active()
 
 
 class MicrophoneStream:
@@ -81,6 +177,7 @@ def request_stream(
     recognizer: str,
     rate: int,
     chunk_size: int,
+    controller: StreamingController,
 ) -> Iterable[speech_v2.StreamingRecognizeRequest]:
     """Yield requests for the streaming recognizer."""
 
@@ -95,11 +192,17 @@ def request_stream(
         ),
     )
 
+    streaming_features = speech_v2.StreamingRecognitionFeatures(interim_results=True)
+    # Enable voice activity events when the client library exposes the field.
+    voice_events_config = getattr(streaming_features, "voice_activity_events", None)
+    if voice_events_config is not None:
+        voice_events_config.enable_voice_activity_events = True
+    elif hasattr(streaming_features, "enable_voice_activity_events"):
+        setattr(streaming_features, "enable_voice_activity_events", True)
+
     streaming_config = speech_v2.StreamingRecognitionConfig(
         config=config,
-        streaming_features=speech_v2.StreamingRecognitionFeatures(
-            interim_results=True,
-        ),
+        streaming_features=streaming_features,
     )
 
     # The first request contains the streaming config.
@@ -109,15 +212,22 @@ def request_stream(
 
     with MicrophoneStream(rate, chunk_size) as stream:
         for chunk in stream.generator():
+            if controller.should_stop():
+                break
             yield speech_v2.StreamingRecognizeRequest(audio=chunk)
 
 
 def print_transcripts(
     responses: Iterable[speech_v2.StreamingRecognizeResponse],
+    controller: StreamingController,
 ) -> None:
     """Print transcripts from streaming responses."""
 
     for response in responses:
+        controller.handle_speech_event_type(getattr(response, "speech_event_type", None))
+        for event in getattr(response, "voice_activity_events", []) or []:
+            controller.handle_voice_activity_event(event)
+
         for result in response.results:
             if not result.alternatives:
                 continue
@@ -126,6 +236,7 @@ def print_transcripts(
             if not transcript:
                 continue
 
+            controller.mark_transcript_activity()
             prefix = "(final)" if result.is_final else "(interim)"
             confidence = f" {alternative.confidence:.0%}" if result.is_final else ""
             print(f"{prefix} {transcript}{confidence}")
@@ -160,23 +271,46 @@ def parse_args() -> argparse.Namespace:
         default=CHUNK_SIZE,
         help="Chunk size in frames per streaming request (default: 1600)",
     )
+    parser.add_argument(
+        "--initial-duration",
+        type=float,
+        default=DEFAULT_INITIAL_DURATION,
+        help="Base recording duration in seconds before VAD can stop the stream",
+    )
+    parser.add_argument(
+        "--max-duration",
+        type=float,
+        default=MAX_STREAM_DURATION,
+        help="Maximum recording duration in seconds when audio continues",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.max_duration < args.initial_duration:
+        print(
+            "--max-duration must be greater than or equal to --initial-duration",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     recognizer = (
         f"projects/{args.project_id}/locations/{args.location}/recognizers/{args.recognizer_id}"
     )
 
     client = speech_v2.SpeechClient()
+    controller = StreamingController(
+        base_duration=args.initial_duration, max_duration=args.max_duration
+    )
 
     try:
         responses = client.streaming_recognize(
-            requests=request_stream(recognizer, args.sample_rate, args.chunk_size)
+            requests=request_stream(
+                recognizer, args.sample_rate, args.chunk_size, controller
+            )
         )
         print("Listening... Press Ctrl+C to stop.")
-        print_transcripts(responses)
+        print_transcripts(responses, controller)
     except KeyboardInterrupt:
         print("\nStreaming stopped by user.")
     except Exception as exc:  # pylint: disable=broad-except
