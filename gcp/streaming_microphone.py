@@ -25,6 +25,14 @@ class MicrophoneStream:
     def __enter__(self):
         """コンテキストマネージャーの開始"""
         self._audio_interface = pyaudio.PyAudio()
+
+        # デフォルトのマイクデバイス情報を表示
+        default_input = self._audio_interface.get_default_input_device_info()
+        print(f"使用中のマイクデバイス: {default_input['name']}")
+        print(f"  録音設定: {self._rate} Hz, モノラル (1ch)")
+        print(f"  (デバイス最大: {int(default_input['defaultSampleRate'])} Hz, {default_input['maxInputChannels']}ch)")
+        print()
+
         self._audio_stream = self._audio_interface.open(
             format=pyaudio.paInt16,
             channels=1,  # モノラル

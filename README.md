@@ -36,20 +36,13 @@ cp .env.example .env
 # .envファイルを編集して実際の値を入力
 ```
 
-環境変数を読み込む：
-
-```bash
-# .envファイルから環境変数を読み込む
-export $(cat .env | grep -v '^#' | xargs)
-```
-
 ## 実行手順
 
 ### GCP Speech-to-Text
 
 ```bash
 # 実行
-uv run python gcp/streaming_microphone.py
+uv run --env-file .env python gcp/streaming_microphone.py
 ```
 
 スクリプトは自動的にマイク入力を開始し、リアルタイムで音声認識を行います。デフォルトで日本語（ja-JP）に設定されています。
@@ -66,7 +59,7 @@ transcribe_streaming_mic(language_code="en-US")
 
 ```bash
 # 実行
-uv run python aws/simple_mic.py
+uv run --env-file .env python aws/simple_mic.py
 ```
 
 **注意:** `aws/simple_mic.py`内のリージョンと言語コードを必要に応じて変更してください。

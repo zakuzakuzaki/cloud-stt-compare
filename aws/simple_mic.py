@@ -1,4 +1,5 @@
 import asyncio
+import sys
 
 # This example uses the sounddevice library to get an audio stream from the
 # microphone. It's not a dependency of the project but can be installed with
@@ -23,19 +24,38 @@ class MyEventHandler(TranscriptResultStreamHandler):
         # This handler can be implemented to handle transcriptions as needed.
         # Here's an example to get started.
         results = transcript_event.transcript.results
+        if not results:
+            return
+
         for result in results:
+            if not result.alternatives:
+                continue
             for alt in result.alternatives:
-                print(alt.transcript)
+                transcript = alt.transcript
+                if not transcript:
+                    continue
+                if result.is_partial:
+                    print(f"\r暫定: {transcript}", end="", flush=True)
+                else:
+                    print(f"\n確定: {transcript}")
+                    sys.stdout.flush()
 
 
 async def mic_stream():
     # This function wraps the raw input stream from the microphone forwarding
     # the blocks to an asyncio.Queue.
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     input_queue = asyncio.Queue()
 
     def callback(indata, frame_count, time_info, status):
         loop.call_soon_threadsafe(input_queue.put_nowait, (bytes(indata), status))
+
+    # デフォルトのマイクデバイスを表示
+    default_input = sounddevice.query_devices(kind='input')
+    print(f"使用中のマイクデバイス: {default_input['name']}")
+    print(f"  録音設定: 16000 Hz, モノラル (1ch)")
+    print(f"  (デバイス最大: {default_input['default_samplerate']} Hz, {default_input['max_input_channels']}ch)")
+    print()
 
     # Be sure to use the correct parameters for the audio stream that matches
     # the audio formats described for the source language you'll be using:
@@ -64,22 +84,34 @@ async def write_chunks(stream):
 
 
 async def basic_transcribe():
+    print("AWS Transcribeに接続しています...")
+
     # Setup up our client with our chosen AWS region
     client = TranscribeStreamingClient(region="us-west-2")
 
+    print("ストリーミングを開始します...")
     # Start transcription to generate our async stream
     stream = await client.start_stream_transcription(
-        language_code="en-US",
+        language_code="ja-JP",
         media_sample_rate_hz=16000,
         media_encoding="pcm",
     )
 
-    # Instantiate our handler and start processing events
-    handler = MyEventHandler(stream.output_stream)
-    await asyncio.gather(write_chunks(stream), handler.handle_events())
+    print("マイクに向かって話してください... (Ctrl+Cで終了)")
+    print("-" * 50)
+
+    try:
+        # Instantiate our handler and start processing events
+        handler = MyEventHandler(stream.output_stream)
+        await asyncio.gather(write_chunks(stream), handler.handle_events())
+    except KeyboardInterrupt:
+        print("\n\n音声認識を終了しました。")
+    except Exception as e:
+        print(f"\nエラーが発生しました: {e}")
+        import traceback
+        traceback.print_exc()
 
 
-loop = asyncio.get_event_loop()
-loop.run_until_complete(basic_transcribe())
-loop.close()
+if __name__ == "__main__":
+    asyncio.run(basic_transcribe())
 
