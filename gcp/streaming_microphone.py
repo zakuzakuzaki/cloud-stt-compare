@@ -1,322 +1,170 @@
-"""Streaming microphone input to Google Cloud Speech-to-Text v2.
-
-This script records audio from the system default microphone, streams it to a
-Google Cloud Speech-to-Text v2 recognizer, and prints transcription results in
-real time. It is inspired by Google's streaming recognition example for v2 but
-captures audio from a live microphone instead of reading from a local file. The
-stream automatically leverages voice activity detection (VAD) events to stop
-recording after roughly six seconds of silence while allowing speech to extend
-the session up to thirty seconds.
-
-Prerequisites:
-  * Install dependencies: `pip install google-cloud-speech sounddevice`.
-  * Set the `GOOGLE_APPLICATION_CREDENTIALS` environment variable to point to a
-    service account JSON file that has permission to use the Speech-to-Text API.
-  * Create a recognizer resource in the target project/location.
-
-Usage:
-    python streaming_microphone.py \
-        --project-id=my-project \
-        --location=us-central1 \
-        --recognizer-id=my-recognizer
-
-Press Ctrl+C to stop streaming.
-"""
-from __future__ import annotations
-
-import argparse
+import os
 import queue
 import sys
-import threading
-import time
-from typing import Generator, Iterable
+from google.cloud.speech_v2 import SpeechClient
+from google.cloud.speech_v2.types import cloud_speech as cloud_speech_types
+import pyaudio
 
-import sounddevice as sd
-from google.cloud import speech_v2
+# プロジェクトID
+PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT")
 
-
-DEFAULT_SAMPLE_RATE = 16000
-CHANNELS = 1
-# Send roughly 100ms of audio per request for low latency.
-CHUNK_SIZE = int(DEFAULT_SAMPLE_RATE / 10)
-# Base duration to capture before voice activity driven extensions (seconds).
-DEFAULT_INITIAL_DURATION = 6.0
-# Maximum duration allowed for a single streaming session (seconds).
-MAX_STREAM_DURATION = 30.0
-
-
-class StreamingController:
-    """Coordinate stream lifetime based on voice activity events."""
-
-    def __init__(self, base_duration: float, max_duration: float) -> None:
-        self.base_duration = base_duration
-        self.max_duration = max_duration
-        self.start_time = time.monotonic()
-        self.last_activity = self.start_time
-        self.voice_active = False
-        self._lock = threading.Lock()
-
-    def mark_voice_active(self) -> None:
-        """Record that the API detected voice activity."""
-
-        with self._lock:
-            self.voice_active = True
-            self.last_activity = time.monotonic()
-
-    def mark_voice_inactive(self) -> None:
-        """Record that the API detected the end of voice activity."""
-
-        with self._lock:
-            self.voice_active = False
-
-    def mark_transcript_activity(self) -> None:
-        """Record transcript updates as ongoing activity."""
-
-        with self._lock:
-            self.last_activity = time.monotonic()
-
-    def should_stop(self) -> bool:
-        """Return True when streaming should stop based on timers/VAD."""
-
-        now = time.monotonic()
-        with self._lock:
-            elapsed = now - self.start_time
-            if elapsed >= self.max_duration:
-                return True
-            if elapsed <= self.base_duration:
-                return False
-            if self.voice_active:
-                return False
-            # Allow a small grace period after the last detected activity.
-            if (now - self.last_activity) <= 1.5:
-                return False
-            return True
-
-    def handle_voice_activity_event(
-        self, event: speech_v2.StreamingRecognizeResponse.VoiceActivityEvent
-    ) -> None:
-        """Interpret VAD events from the API and update state."""
-
-        event_type = getattr(event, "voice_activity_event_type", None)
-        if event_type is None:
-            return
-
-        # The enum may expose either a string representation or an Enum object.
-        if hasattr(event_type, "name"):
-            name = event_type.name
-        else:
-            name = str(event_type)
-
-        normalized = name.upper()
-        if "UNSPECIFIED" in normalized:
-            return
-        if "END" in normalized or "STOP" in normalized:
-            self.mark_voice_inactive()
-        else:
-            self.mark_voice_active()
-
-    def handle_speech_event_type(self, event_type: object) -> None:
-        """Fallback handling for speech event types when VAD events are absent."""
-
-        if event_type is None:
-            return
-        if hasattr(event_type, "name"):
-            name = event_type.name
-        else:
-            name = str(event_type)
-
-        normalized = name.upper()
-        if "END" in normalized:
-            self.mark_voice_inactive()
-        elif "SPEECH" in normalized or "START" in normalized:
-            self.mark_voice_active()
+# 音声録音パラメータ
+RATE = 16000  # サンプリングレート
+CHUNK = int(RATE / 10)  # 100ms
 
 
 class MicrophoneStream:
-    """Open a recording stream as a generator yielding raw audio chunks."""
+    """マイクからの音声ストリームをジェネレーターとして提供するクラス"""
+    
+    def __init__(self, rate=RATE, chunk=CHUNK):
+        self._rate = rate
+        self._chunk = chunk
+        self._buff = queue.Queue()
+        self.closed = True
 
-    def __init__(self, rate: int, chunk_size: int) -> None:
-        self.rate = rate
-        self.chunk_size = chunk_size
-        self._buff: "queue.Queue[bytes]" = queue.Queue()
-        self._stream: sd.InputStream | None = None
-
-    def __enter__(self) -> "MicrophoneStream":
-        self._stream = sd.InputStream(
-            samplerate=self.rate,
-            channels=CHANNELS,
-            dtype="int16",
-            blocksize=self.chunk_size,
-            callback=self._callback,
+    def __enter__(self):
+        """コンテキストマネージャーの開始"""
+        self._audio_interface = pyaudio.PyAudio()
+        self._audio_stream = self._audio_interface.open(
+            format=pyaudio.paInt16,
+            channels=1,  # モノラル
+            rate=self._rate,
+            input=True,
+            frames_per_buffer=self._chunk,
+            stream_callback=self._fill_buffer,
         )
-        self._stream.start()
+        self.closed = False
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:  # type: ignore[override]
-        if self._stream:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
-        # Signal the generator to stop.
-        self._buff.put_nowait(b"")
+    def __exit__(self, type, value, traceback):
+        """コンテキストマネージャーの終了"""
+        self._audio_stream.stop_stream()
+        self._audio_stream.close()
+        self.closed = True
+        self._buff.put(None)
+        self._audio_interface.terminate()
 
-    def _callback(self, indata, frames, time_info, status) -> None:  # type: ignore[override]
-        if status:
-            print(f"Microphone status: {status}", file=sys.stderr)
-        self._buff.put(indata.tobytes())
+    def _fill_buffer(self, in_data, frame_count, time_info, status_flags):
+        """PyAudioのコールバック関数 - 音声データをバッファに追加"""
+        self._buff.put(in_data)
+        return None, pyaudio.paContinue
 
-    def generator(self) -> Generator[bytes, None, None]:
-        while True:
+    def generator(self):
+        """音声データのジェネレーター"""
+        while not self.closed:
             chunk = self._buff.get()
-            if chunk == b"":
+            if chunk is None:
                 return
-            yield chunk
+            data = [chunk]
+            
+            # バッファに残っているデータもすべて取得
+            while True:
+                try:
+                    chunk = self._buff.get(block=False)
+                    if chunk is None:
+                        return
+                    data.append(chunk)
+                except queue.Empty:
+                    break
+            
+            yield b"".join(data)
 
 
-def request_stream(
-    recognizer: str,
-    rate: int,
-    chunk_size: int,
-    controller: StreamingController,
-) -> Iterable[speech_v2.StreamingRecognizeRequest]:
-    """Yield requests for the streaming recognizer."""
+def listen_print_loop(responses):
+    """認識結果を表示する"""
+    num_chars_printed = 0
+    
+    for response in responses:
+        if not response.results:
+            continue
+        
+        # 最初の結果を取得
+        result = response.results[0]
+        if not result.alternatives:
+            continue
+        
+        # 最も確率の高い転写結果を取得
+        transcript = result.alternatives[0].transcript
+        
+        # 前の出力を上書きするための空白
+        overwrite_chars = " " * (num_chars_printed - len(transcript))
+        
+        if not result.is_final:
+            # 暫定結果 - 同じ行に上書き
+            sys.stdout.write(transcript + overwrite_chars + "\r")
+            sys.stdout.flush()
+            num_chars_printed = len(transcript)
+        else:
+            # 確定結果 - 改行して表示
+            print(transcript + overwrite_chars)
+            num_chars_printed = 0
 
-    config = speech_v2.RecognitionConfig(
-        language_codes=["ja-JP"],
-        model="latest_long",
-        features=speech_v2.RecognitionFeatures(enable_automatic_punctuation=True),
-        explicit_decoding_config=speech_v2.ExplicitDecodingConfig(
-            encoding=speech_v2.ExplicitDecodingConfig.AudioEncoding.LINEAR16,
-            sample_rate_hertz=rate,
-            audio_channel_count=CHANNELS,
+
+def transcribe_streaming_mic(language_code="ja-JP"):
+    """マイクからの音声をストリーミング認識する
+    
+    Args:
+        language_code (str): 言語コード (例: "ja-JP", "en-US")
+    """
+    client = SpeechClient()
+    
+    # 認識設定
+    recognition_config = cloud_speech_types.RecognitionConfig(
+        explicit_decoding_config=cloud_speech_types.ExplicitDecodingConfig(
+            encoding=cloud_speech_types.ExplicitDecodingConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=RATE,
+            audio_channel_count=1,
+        ),
+        language_codes=[language_code],
+        model="long",
+    )
+    
+    # ストリーミング設定
+    streaming_config = cloud_speech_types.StreamingRecognitionConfig(
+        config=recognition_config,
+        streaming_features=cloud_speech_types.StreamingRecognitionFeatures(
+            interim_results=True  # 暫定結果を有効化
         ),
     )
-
-    streaming_features = speech_v2.StreamingRecognitionFeatures(interim_results=True)
-    # Enable voice activity events when the client library exposes the field.
-    voice_events_config = getattr(streaming_features, "voice_activity_events", None)
-    if voice_events_config is not None:
-        voice_events_config.enable_voice_activity_events = True
-    elif hasattr(streaming_features, "enable_voice_activity_events"):
-        setattr(streaming_features, "enable_voice_activity_events", True)
-
-    streaming_config = speech_v2.StreamingRecognitionConfig(
-        config=config,
-        streaming_features=streaming_features,
+    
+    # 最初の設定リクエスト
+    config_request = cloud_speech_types.StreamingRecognizeRequest(
+        recognizer=f"projects/{PROJECT_ID}/locations/global/recognizers/_",
+        streaming_config=streaming_config,
     )
-
-    # The first request contains the streaming config.
-    yield speech_v2.StreamingRecognizeRequest(
-        recognizer=recognizer, streaming_config=streaming_config
-    )
-
-    with MicrophoneStream(rate, chunk_size) as stream:
-        for chunk in stream.generator():
-            if controller.should_stop():
-                break
-            yield speech_v2.StreamingRecognizeRequest(audio=chunk)
-
-
-def print_transcripts(
-    responses: Iterable[speech_v2.StreamingRecognizeResponse],
-    controller: StreamingController,
-) -> None:
-    """Print transcripts from streaming responses."""
-
-    for response in responses:
-        controller.handle_speech_event_type(getattr(response, "speech_event_type", None))
-        for event in getattr(response, "voice_activity_events", []) or []:
-            controller.handle_voice_activity_event(event)
-
-        for result in response.results:
-            if not result.alternatives:
-                continue
-            alternative = result.alternatives[0]
-            transcript = alternative.transcript.strip()
-            if not transcript:
-                continue
-
-            controller.mark_transcript_activity()
-            prefix = "(final)" if result.is_final else "(interim)"
-            confidence = f" {alternative.confidence:.0%}" if result.is_final else ""
-            print(f"{prefix} {transcript}{confidence}")
-            # Flush to ensure timely display when piping output.
-            sys.stdout.flush()
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Stream microphone audio to Google Cloud Speech-to-Text v2.",
-    )
-    parser.add_argument("--project-id", required=True, help="Google Cloud project ID")
-    parser.add_argument(
-        "--location",
-        default="global",
-        help="Location of the recognizer (default: global)",
-    )
-    parser.add_argument(
-        "--recognizer-id",
-        required=True,
-        help="Recognizer ID (without the projects/... prefix)",
-    )
-    parser.add_argument(
-        "--sample-rate",
-        type=int,
-        default=DEFAULT_SAMPLE_RATE,
-        help="Sampling rate for microphone capture (default: 16000)",
-    )
-    parser.add_argument(
-        "--chunk-size",
-        type=int,
-        default=CHUNK_SIZE,
-        help="Chunk size in frames per streaming request (default: 1600)",
-    )
-    parser.add_argument(
-        "--initial-duration",
-        type=float,
-        default=DEFAULT_INITIAL_DURATION,
-        help="Base recording duration in seconds before VAD can stop the stream",
-    )
-    parser.add_argument(
-        "--max-duration",
-        type=float,
-        default=MAX_STREAM_DURATION,
-        help="Maximum recording duration in seconds when audio continues",
-    )
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    if args.max_duration < args.initial_duration:
-        print(
-            "--max-duration must be greater than or equal to --initial-duration",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    recognizer = (
-        f"projects/{args.project_id}/locations/{args.location}/recognizers/{args.recognizer_id}"
-    )
-
-    client = speech_v2.SpeechClient()
-    controller = StreamingController(
-        base_duration=args.initial_duration, max_duration=args.max_duration
-    )
-
+    
+    def request_generator(config, audio_generator):
+        """リクエストのジェネレーター"""
+        yield config
+        for content in audio_generator:
+            yield cloud_speech_types.StreamingRecognizeRequest(audio=content)
+    
+    print("マイクに向かって話してください... (Ctrl+Cで終了)")
+    print("-" * 50)
+    
     try:
-        responses = client.streaming_recognize(
-            requests=request_stream(
-                recognizer, args.sample_rate, args.chunk_size, controller
-            )
-        )
-        print("Listening... Press Ctrl+C to stop.")
-        print_transcripts(responses, controller)
+        with MicrophoneStream(RATE, CHUNK) as stream:
+            audio_generator = stream.generator()
+            requests = request_generator(config_request, audio_generator)
+            
+            # ストリーミング認識を実行
+            responses = client.streaming_recognize(requests=requests)
+            
+            # 結果を処理
+            listen_print_loop(responses)
+    
     except KeyboardInterrupt:
-        print("\nStreaming stopped by user.")
-    except Exception as exc:  # pylint: disable=broad-except
-        print(f"Error during streaming recognition: {exc}", file=sys.stderr)
-        sys.exit(1)
+        print("\n\n音声認識を終了しました。")
+    except Exception as e:
+        print(f"\nエラーが発生しました: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
-    main()
+    # 使用例
+    # 日本語認識の場合
+    transcribe_streaming_mic(language_code="ja-JP")
+    
+    # 英語認識の場合は以下のように呼び出す
+    # transcribe_streaming_mic(language_code="en-US")
